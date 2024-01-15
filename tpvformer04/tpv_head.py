@@ -11,7 +11,7 @@ from mmcv.runner import force_fp32, auto_fp16
 
 from .modules.cross_view_hybrid_attention import TPVCrossViewHybridAttention
 from .modules.image_cross_attention import TPVMSDeformableAttention3D
-
+import ipdb
 
 @HEADS.register_module()
 class TPVFormerHead(BaseModule):
@@ -92,6 +92,8 @@ class TPVFormerHead(BaseModule):
         tpv_mask_hw = self.tpv_mask_hw.expand(bs, -1, -1)
         tpv_pos_hw = self.positional_encoding(tpv_mask_hw).to(dtype)
         tpv_pos_hw = tpv_pos_hw.flatten(2).transpose(1, 2)
+        
+        #ipdb.set_trace()
         
         # flatten image features of different scales
         feat_flatten = []

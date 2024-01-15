@@ -175,8 +175,9 @@ def main(local_rank, args):
         time.sleep(10)
         data_time_s = time.time()
         time_s = time.time()
+        import ipdb
         for i_iter, (imgs, img_metas, train_vox_label, train_grid, train_pt_labs) in enumerate(train_dataset_loader):
-            
+            #ipdb.set_trace()
             imgs = imgs.cuda()
             train_grid = train_grid.to(torch.float32).cuda()
             if cfg.lovasz_input == 'voxel' or cfg.ce_input == 'voxel':
@@ -325,5 +326,5 @@ if __name__ == '__main__':
     ngpus = torch.cuda.device_count()
     args.gpus = ngpus
     print(args)
-
-    torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
+    main(0,args)
+    #torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
