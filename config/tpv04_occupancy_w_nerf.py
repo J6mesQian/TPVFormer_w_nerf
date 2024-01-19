@@ -1,8 +1,20 @@
-_base_ = [
-    './_base_/optimizer.py',
-    './_base_/schedule.py',
-]
+optimizer = dict(
+    type='AdamW',
+    lr=2e-4,
+    paramwise_cfg=dict(
+        custom_keys={
+            'img_backbone': dict(lr_mult=0.1),
+        }
+    ),
+    weight_decay=0.01
+)
 
+grad_max_norm = 35
+
+print_freq = 10
+max_epochs = 24
+
+load_from = './ckpts/r101_dcn_fcos3d_pretrain.pth'
 dataset_params = dict(
     version = "v1.0-trainval",
     ignore_label = 0,

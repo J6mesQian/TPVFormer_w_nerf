@@ -131,13 +131,13 @@ class TPVAggregator_w_NeRF(BaseModule):
 
         out_dims = in_dims if out_dims is None else out_dims
 
-        self.decoder = nn.Sequential(
-            nn.Linear(in_dims, hidden_dims),
-            nn.Softplus(),
-            nn.Linear(hidden_dims, out_dims)
-        )
+        # self.decoder = nn.Sequential(
+        #     nn.Linear(in_dims, hidden_dims),
+        #     nn.Softplus(),
+        #     nn.Linear(hidden_dims, out_dims)
+        # )
 
-        self.classifier = nn.Linear(out_dims, nbr_classes)
+        # self.classifier = nn.Linear(out_dims, nbr_classes)
         self.classes = nbr_classes
         self.use_checkpoint = use_checkpoint
     

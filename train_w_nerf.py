@@ -3,6 +3,9 @@ import os, time, argparse, os.path as osp, numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import wandb
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 
 from utils.metric_util import MeanIoU
 from utils.load_save_util import revise_ckpt, revise_ckpt_2
@@ -18,6 +21,7 @@ from timm.scheduler import CosineLRScheduler
 import warnings
 warnings.filterwarnings("ignore")
 
+save_val_scene_token = ['e7ef871f77f44331aefdebc24ec034b7', '55b3a17359014f398b6bbd90e94a8e1b', '85889db3628342a482c5c0255e5347e9', '5301151d8b6a42b0b252e95634bd3995', '952cb0bcd89b4ca4b904cdcbbf595523', 'fb73d1a6c16147ee9416faf6b310fadb']
 
 def pass_print(*args, **kwargs):
     pass
@@ -61,8 +65,31 @@ def main(local_rank, args):
 
     # configure logger
     if dist.get_rank() == 0:
+
+        # Generate a timestamped run name
+        current_time = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+        run_name = f"{current_time}-TPVformer_w_NeRF_exp0_L1_loss"
+        print(f"Starting training run {run_name}")
+        
+        
+        work_dir_base = args.work_dir
+        args.work_dir = os.path.join(args.work_dir, run_name)
         os.makedirs(args.work_dir, exist_ok=True)
         cfg.dump(osp.join(args.work_dir, osp.basename(args.py_config)))
+
+        # Initialize wandb
+        # wandb.init(project='Neural-Driving_Field', entity='neural-scenes', name=run_name)
+
+        # Path for TensorBoard logs
+        log_dir = os.path.join("./tensorboar_log", run_name)
+        
+        val_save_dir = osp.join(args.work_dir, 'val_output', run_name)
+        # mkdir allow exist
+        os.makedirs(val_save_dir, exist_ok=True)
+
+        # Initialize TensorBoard writer
+        writer = SummaryWriter(log_dir)
+        
 
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = osp.join(args.work_dir, f'{timestamp}.log')
@@ -187,7 +214,8 @@ def main(local_rank, args):
             outputs_vox_feat = my_model(img=imgs, img_metas=img_metas)
 
             mse_loss = nn.MSELoss()
-            loss = mse_loss(train_nerf_vox_feat, outputs_vox_feat)
+            L1_loss = nn.L1Loss()
+            loss = L1_loss(train_nerf_vox_feat, outputs_vox_feat)
 
             optimizer.zero_grad()
             loss.backward()
@@ -205,6 +233,14 @@ def main(local_rank, args):
                     loss.item(), np.mean(loss_list), grad_norm, lr,
                     time_e - time_s, data_time_e - data_time_s
                 ))
+            if dist.get_rank() == 0:
+                #wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": grad_norm, "train/step_time": time_e - time_s, "train/data_time": data_time_e - data_time_s})
+                writer.add_scalar("train/loss", loss.item(), global_iter)
+                writer.add_scalar("train/lr", lr, global_iter)
+                writer.add_scalar("train/grad_norm", grad_norm, global_iter)
+                writer.add_scalar("train/step_time", time_e - time_s, global_iter)
+                writer.add_scalar("train/data_time", data_time_e - data_time_s, global_iter)
+                
             data_time_s = time.time()
             time_s = time.time()
         
@@ -238,13 +274,27 @@ def main(local_rank, args):
                 imgs = imgs.cuda()
                 val_nerf_vox_feat = val_nerf_vox_feat.cuda()
 
-                predict_labels_vox, predict_labels_pts = my_model(img=imgs, img_metas=img_metas)
-                loss = nn.MSELoss(val_nerf_vox_feat, predict_labels_vox)
+                outputs_vox_feat_val = my_model(img=imgs, img_metas=img_metas)
+                mseloss = nn.MSELoss()
+                L1_loss = nn.L1Loss()
+                loss = L1_loss(val_nerf_vox_feat, outputs_vox_feat_val)
                 
                 val_loss_list.append(loss.detach().cpu().numpy())
                 if i_iter_val % print_freq == 0 and dist.get_rank() == 0:
                     logger.info('[EVAL] Epoch %d Iter %5d: Loss: %.3f (%.3f)'%(
                         epoch, i_iter_val, loss.item(), np.mean(val_loss_list)))
+                if dist.get_rank() == 0:
+                    # wandb.log({"val/loss": loss.item()})
+                    writer.add_scalar("val/loss", loss.item(), global_iter)
+                if img_metas[0]['scene_token'] in save_val_scene_token:
+                    save_base_dir = osp.join(val_save_dir, "epoch_{}".format(epoch), img_metas[0]['scene_token'])
+                    os.makedirs(save_base_dir, exist_ok=True)
+                    outputs_vox_feat_val = outputs_vox_feat_val.detach().cpu().numpy()
+                    save_path = osp.join(save_base_dir, "{}-{}_pred_vox_feat.npy".format(i_iter_val, img_metas[0]['sample_idx']))
+                    np.save(save_path, outputs_vox_feat_val)
+                    logger.info('save pred vox feat to {}'.format(save_path))
+                    
+                    
         
         # val_miou_pts = CalMeanIou_pts._after_epoch()
         # val_miou_vox = CalMeanIou_vox._after_epoch()
@@ -273,6 +323,7 @@ if __name__ == '__main__':
     
     ngpus = torch.cuda.device_count()
     args.gpus = ngpus
+    print(f"Avaliable GPU: {ngpus}")
     print(args)
-    main(0,args)
-    #torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
+    # main(0,args)
+    torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
