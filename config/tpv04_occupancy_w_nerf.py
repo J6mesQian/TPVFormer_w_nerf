@@ -25,20 +25,21 @@ dataset_params = dict(
     min_volume_space = [-51.2, -51.2, -5],
 )
 
+batch_size = 1
 train_data_loader = dict(
     data_path = "data/nuscenes/",
     imageset = "./data/nuscenes_infos_train_aug.pkl",
-    batch_size = 1,
+    batch_size = batch_size,
     shuffle = True,
-    num_workers = 1,
+    num_workers = 10,
 )
 
 val_data_loader = dict(
     data_path = "data/nuscenes/",
     imageset = "./data/nuscenes_infos_val_aug.pkl",
-    batch_size = 1,
+    batch_size = batch_size,
     shuffle = False,
-    num_workers = 1,
+    num_workers = 10,
 )
 
 unique_label = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -73,7 +74,7 @@ scale_z = 1
 grid_size = [tpv_h_*scale_h, tpv_w_*scale_w, tpv_z_*scale_z]
 num_points_in_pillar = [4, 32, 32]
 num_points = [8, 64, 64]
-nbr_class = 18
+nbr_class = 1
 
 model = dict(
     type='TPVFormer_w_NeRF',
@@ -133,6 +134,7 @@ model = dict(
             pc_range=point_cloud_range,
             num_points_in_pillar=num_points_in_pillar,
             return_intermediate=False,
+            batch_size = batch_size,
             transformerlayers=dict(
                 type='TPVFormerLayer',
                 attn_cfgs=[

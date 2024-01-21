@@ -9,6 +9,27 @@ from typing import List, Union
 from torch import Tensor
 import torch.nn.functional as F
 
+def identify_outliers(tensor, percentile=99):
+    # Calculate the lower and upper percentile bounds
+    lower_percentile_bound = (100 - percentile) / 2
+    upper_percentile_bound = 100 - lower_percentile_bound
+
+    # Compute percentiles
+    lower_bound = torch.quantile(tensor, lower_percentile_bound / 100)
+    upper_bound = torch.quantile(tensor, upper_percentile_bound / 100)
+
+    # Identify outliers
+    mask = (tensor < lower_bound) | (tensor > upper_bound)
+    outlier_indices = mask.all(dim=1)  # Consider a point an outlier if any of its features are outliers
+
+    return outlier_indices
+
+def normalize_tensor(tensor):
+    tensor_min = tensor.min()
+    tensor_max = tensor.max()
+    tensor = 2 * (tensor - tensor_min) / (tensor_max - tensor_min) - 1
+    return tensor
+
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
 
@@ -54,17 +75,23 @@ def world_coords_to_voxel_coords(
     point = torch.tensor(point) if isinstance(point, List) else point
     aabb_min = torch.tensor(aabb_min) if isinstance(aabb_min, List) else aabb_min
     aabb_max = torch.tensor(aabb_max) if isinstance(aabb_max, List) else aabb_max
-    voxel_resolution = (
-        torch.tensor(voxel_resolution)
-        if isinstance(voxel_resolution, List)
-        else voxel_resolution
-    )
+    if isinstance(voxel_resolution, List):
+        voxel_resolution = torch.tensor(voxel_resolution)
+    elif isinstance(voxel_resolution, np.ndarray):
+        voxel_resolution = torch.from_numpy(voxel_resolution)
+
+    # Ensure voxel_resolution is a tensor
+    voxel_resolution = voxel_resolution.to(point.dtype).to(point.device)
 
     # Compute the size of each voxel
     voxel_size = (aabb_max - aabb_min) / voxel_resolution
 
     # Compute the voxel index for the given point
     voxel_idx = ((point - aabb_min) / voxel_size).long()
+
+    # Clamp voxel_idx to ensure it's less than voxel_resolution
+    # Adjusted to broadcast voxel_resolution for each point
+    voxel_idx = torch.min(voxel_idx, voxel_resolution.unsqueeze(0) - 1)
 
     return voxel_idx
 
@@ -229,6 +256,19 @@ class DatasetWrapper_NuScenes_NeRF(data.Dataset):
     def __getitem__(self, index):
         data = self.imagepoint_dataset[index]
         imgs, img_metas, nerf_dino_feat, nerf_voxel_coords = data
+        
+        # Identify outliers
+        outlier_indices = identify_outliers(nerf_dino_feat)
+
+        # Filter both tensors to remove outliers
+        filtered_nerf_dino_feat = nerf_dino_feat[~outlier_indices]
+        filtered_nerf_voxel_coords = nerf_voxel_coords[~outlier_indices]
+
+        # Normalize filtered nerf_dino_feat
+        normalized_nerf_dino_feat = normalize_tensor(filtered_nerf_dino_feat)
+        
+        nerf_dino_feat = normalized_nerf_dino_feat
+        nerf_voxel_coords = filtered_nerf_voxel_coords
 
         # deal with img augmentations
         imgs_dict = {'img': imgs, 'lidar2img': img_metas['lidar2img']}
@@ -255,9 +295,9 @@ class DatasetWrapper_NuScenes_NeRF(data.Dataset):
         nerf_world_coords_extended_lidar_t_sample = (nerf_world_coords_homo @ torch.inverse(lidar_to_first_nerf_ego_transform).T)[:,:3]
         
         # Create a mask for each condition
-        mask_x = (nerf_world_coords_extended_lidar_t_sample[:, 0] >= min_bound[0]) & (nerf_world_coords_extended_lidar_t_sample[:, 0] <= max_bound[0])
-        mask_y = (nerf_world_coords_extended_lidar_t_sample[:, 1] >= min_bound[1]) & (nerf_world_coords_extended_lidar_t_sample[:, 1] <= max_bound[1])
-        mask_z = (nerf_world_coords_extended_lidar_t_sample[:, 2] >= min_bound[2]) & (nerf_world_coords_extended_lidar_t_sample[:, 2] <= max_bound[2])
+        mask_x = (nerf_world_coords_extended_lidar_t_sample[:, 0] > min_bound[0]) & (nerf_world_coords_extended_lidar_t_sample[:, 0] < max_bound[0])
+        mask_y = (nerf_world_coords_extended_lidar_t_sample[:, 1] > min_bound[1]) & (nerf_world_coords_extended_lidar_t_sample[:, 1] < max_bound[1])
+        mask_z = (nerf_world_coords_extended_lidar_t_sample[:, 2] >=min_bound[2]) & (nerf_world_coords_extended_lidar_t_sample[:, 2] < max_bound[2])
 
         # Combine masks to identify rows that meet all conditions
         mask = mask_x & mask_y & mask_z
@@ -268,10 +308,13 @@ class DatasetWrapper_NuScenes_NeRF(data.Dataset):
         
         filtered_nerf_sample_vox_coords = world_coords_to_voxel_coords(filtered_nerf_sample_world_coords, min_bound, max_bound, self.grid_size)
         filtered_nerf_voxels_dino_feature_sample = torch.zeros((*self.grid_size, 64))
-        filtered_nerf_voxels_dino_feature_sample[filtered_nerf_sample_world_coords[...,0].long(),filtered_nerf_sample_world_coords[...,1].long(),filtered_nerf_sample_world_coords[...,2].long()] = filtered_nerf_sample_feats
+        filtered_nerf_voxels_dino_feature_sample[filtered_nerf_sample_vox_coords[...,0].long(),filtered_nerf_sample_vox_coords[...,1].long(),filtered_nerf_sample_vox_coords[...,2].long()] = filtered_nerf_sample_feats
         filtered_nerf_voxels_dino_feature_sample = filtered_nerf_voxels_dino_feature_sample.permute(3,0,1,2) # (embed_dim, x, y, z)
+        filtered_nerf_voxels_occupied_label_sample = torch.zeros((*self.grid_size, 1))
+        filtered_nerf_voxels_occupied_label_sample[filtered_nerf_sample_vox_coords[...,0].long(),filtered_nerf_sample_vox_coords[...,1].long(),filtered_nerf_sample_vox_coords[...,2].long()] = 1
+        filtered_nerf_voxels_occupied_label_sample = filtered_nerf_voxels_occupied_label_sample.permute(3,0,1,2) # (1, x, y, z)
         
-        data_tuple = (imgs, img_metas, filtered_nerf_voxels_dino_feature_sample)
+        data_tuple = (imgs, img_metas, filtered_nerf_voxels_dino_feature_sample, filtered_nerf_voxels_occupied_label_sample)
         
         return data_tuple
 
@@ -281,6 +324,130 @@ def custom_collate_fn_w_nerf(data):
     img2stack = np.stack([d[0] for d in data]).astype(np.float32)
     meta2stack = [d[1] for d in data]
     nerf_feat2stack = torch.stack([d[2] for d in data]).float()
+    vox_label = torch.stack([d[3] for d in data]).float()
     return torch.from_numpy(img2stack), \
         meta2stack, \
-        nerf_feat2stack
+        nerf_feat2stack, \
+        vox_label
+        
+class DatasetWrapper_NuScenes_NeRF_binary_occ(data.Dataset):
+    def __init__(self, in_dataset, grid_size, fill_label=0,
+                 fixed_volume_space=False, max_volume_space=[51.2, 51.2, 3], 
+                 min_volume_space=[-51.2, -51.2, -5], phase='train', scale_rate=1):
+        'Initialization'
+        self.imagepoint_dataset = in_dataset
+        self.grid_size = np.asarray(grid_size)
+        self.fill_label = fill_label
+        self.fixed_volume_space = fixed_volume_space
+        self.max_volume_space = max_volume_space
+        self.min_volume_space = min_volume_space
+
+        if scale_rate != 1:
+            if phase == 'train':
+                transforms = [
+                    PhotoMetricDistortionMultiViewImage(),
+                    NormalizeMultiviewImage(**img_norm_cfg),
+                    RandomScaleImageMultiViewImage([scale_rate]),
+                    PadMultiViewImage(size_divisor=32)
+                ]
+            else:
+                transforms = [
+                    NormalizeMultiviewImage(**img_norm_cfg),
+                    RandomScaleImageMultiViewImage([scale_rate]),
+                    PadMultiViewImage(size_divisor=32)
+                ]
+        else:
+            if phase == 'train':
+                transforms = [
+                    PhotoMetricDistortionMultiViewImage(),
+                    NormalizeMultiviewImage(**img_norm_cfg),
+                    PadMultiViewImage(size_divisor=32)
+                ]
+            else:
+                transforms = [
+                    NormalizeMultiviewImage(**img_norm_cfg),
+                    PadMultiViewImage(size_divisor=32)
+                ]
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.imagepoint_dataset)
+
+    def __getitem__(self, index):
+        data = self.imagepoint_dataset[index]
+        imgs, img_metas, nerf_dino_feat, nerf_voxel_coords = data
+        
+        # Identify outliers
+        outlier_indices = identify_outliers(nerf_dino_feat)
+
+        # Filter both tensors to remove outliers
+        filtered_nerf_dino_feat = nerf_dino_feat[outlier_indices]
+        filtered_nerf_voxel_coords = nerf_voxel_coords[outlier_indices]
+
+        # Normalize filtered nerf_dino_feat
+        normalized_nerf_dino_feat = normalize_tensor(filtered_nerf_dino_feat)
+        
+        nerf_dino_feat = normalized_nerf_dino_feat
+        nerf_voxel_coords = filtered_nerf_voxel_coords
+
+        # deal with img augmentations
+        imgs_dict = {'img': imgs, 'lidar2img': img_metas['lidar2img']}
+        for t in self.transforms:
+            imgs_dict = t(imgs_dict)
+        imgs = imgs_dict['img']
+        imgs = [img.transpose(2, 0, 1) for img in imgs]
+
+        img_metas['img_shape'] = imgs_dict['img_shape']
+        img_metas['lidar2img'] = imgs_dict['lidar2img']
+
+        assert self.fixed_volume_space
+        max_bound = torch.Tensor(self.max_volume_space)  # 51.2 51.2 3
+        min_bound = torch.Tensor(self.min_volume_space)  # -51.2 -51.2 -5
+        
+        # add by Yuxi Qian
+        nerf_voxel_resolution_scene = img_metas['nerf_voxel_resolution']
+        nerf_aabb_min_scene = torch.Tensor(img_metas['nerf_aabb_min'])
+        nerf_aabb_max_scene = torch.Tensor(img_metas['nerf_aabb_max'])
+        lidar_to_first_nerf_ego_transform = torch.Tensor(img_metas['lidar_to_first_ego_transform'])
+        
+        nerf_voxel_coords_world = voxel_coords_to_world_coords(nerf_aabb_min_scene, nerf_aabb_max_scene, nerf_voxel_resolution_scene, nerf_voxel_coords)
+        nerf_world_coords_homo = torch.cat((nerf_voxel_coords_world, torch.ones(nerf_voxel_coords_world.shape[0], 1)), dim=1)
+        nerf_world_coords_extended_lidar_t_sample = (nerf_world_coords_homo @ torch.inverse(lidar_to_first_nerf_ego_transform).T)[:,:3]
+        
+        # Create a mask for each condition
+        mask_x = (nerf_world_coords_extended_lidar_t_sample[:, 0] > min_bound[0]) & (nerf_world_coords_extended_lidar_t_sample[:, 0] < max_bound[0])
+        mask_y = (nerf_world_coords_extended_lidar_t_sample[:, 1] > min_bound[1]) & (nerf_world_coords_extended_lidar_t_sample[:, 1] < max_bound[1])
+        mask_z = (nerf_world_coords_extended_lidar_t_sample[:, 2] >=min_bound[2]) & (nerf_world_coords_extended_lidar_t_sample[:, 2] < max_bound[2])
+
+        # Combine masks to identify rows that meet all conditions
+        mask = mask_x & mask_y & mask_z
+
+        # Apply the mask to filter the tensors
+        filtered_nerf_sample_world_coords = nerf_world_coords_extended_lidar_t_sample[mask]
+        filtered_nerf_sample_feats = nerf_dino_feat[mask]
+        
+        filtered_nerf_sample_vox_coords = world_coords_to_voxel_coords(filtered_nerf_sample_world_coords, min_bound, max_bound, self.grid_size)
+        filtered_nerf_voxels_dino_feature_sample = torch.zeros((*self.grid_size, 64))
+        filtered_nerf_voxels_dino_feature_sample[filtered_nerf_sample_vox_coords[...,0].long(),filtered_nerf_sample_vox_coords[...,1].long(),filtered_nerf_sample_vox_coords[...,2].long()] = filtered_nerf_sample_feats
+        filtered_nerf_voxels_dino_feature_sample = filtered_nerf_voxels_dino_feature_sample.permute(3,0,1,2) # (embed_dim, x, y, z)
+        filtered_nerf_voxels_occupied_label_sample = torch.zeros((*self.grid_size, 1))
+        filtered_nerf_voxels_occupied_label_sample[filtered_nerf_sample_vox_coords[...,0].long(),filtered_nerf_sample_vox_coords[...,1].long(),filtered_nerf_sample_vox_coords[...,2].long()] = 1
+        filtered_nerf_voxels_occupied_label_sample = filtered_nerf_voxels_occupied_label_sample.permute(3,0,1,2) # (1, x, y, z)
+        
+        filtered_nerf_voxels_dino_feature_sample = torch.clamp(filtered_nerf_voxels_dino_feature_sample, min=-10, max=10)
+        
+        data_tuple = (imgs, img_metas, filtered_nerf_voxels_dino_feature_sample, filtered_nerf_voxels_occupied_label_sample)
+        
+        return data_tuple
+
+
+
+def custom_collate_fn_w_nerf(data):
+    img2stack = np.stack([d[0] for d in data]).astype(np.float32)
+    meta2stack = [d[1] for d in data]
+    nerf_feat2stack = torch.stack([d[2] for d in data]).float()
+    vox_label = torch.stack([d[3] for d in data]).float()
+    return torch.from_numpy(img2stack), \
+        meta2stack, \
+        nerf_feat2stack, \
+        vox_label

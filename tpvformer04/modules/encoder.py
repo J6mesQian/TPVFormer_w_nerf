@@ -17,7 +17,7 @@ class TPVFormerEncoder(TransformerLayerSequence):
     """
 
     def __init__(self, *args, tpv_h, tpv_w, tpv_z, pc_range=None, 
-                 num_points_in_pillar=[4, 32, 32], return_intermediate=False, 
+                 num_points_in_pillar=[4, 32, 32], return_intermediate=False, batch_size = 1,
                  **kwargs):
 
         super().__init__(*args, **kwargs)
@@ -28,22 +28,21 @@ class TPVFormerEncoder(TransformerLayerSequence):
         assert num_points_in_pillar[1] == num_points_in_pillar[2] and num_points_in_pillar[1] % num_points_in_pillar[0] == 0
         self.pc_range = pc_range
         self.fp16_enabled = False
-        ref_3d_hw = self.get_reference_points(tpv_h, tpv_w, pc_range[5]-pc_range[2], num_points_in_pillar[0], '3d', device='cpu')
+        ref_3d_hw = self.get_reference_points(tpv_h, tpv_w, pc_range[5]-pc_range[2], num_points_in_pillar[0], '3d', bs=batch_size, device='cpu')
 
-        ref_3d_zh = self.get_reference_points(tpv_z, tpv_h, pc_range[3]-pc_range[0], num_points_in_pillar[1], '3d', device='cpu')
+        ref_3d_zh = self.get_reference_points(tpv_z, tpv_h, pc_range[3]-pc_range[0], num_points_in_pillar[1], '3d', bs=batch_size, device='cpu')
         ref_3d_zh = ref_3d_zh.permute(3, 0, 1, 2)[[2, 0, 1]]
         ref_3d_zh = ref_3d_zh.permute(1, 2, 3, 0)
 
-        ref_3d_wz = self.get_reference_points(tpv_w, tpv_z, pc_range[4]-pc_range[1], num_points_in_pillar[2], '3d', device='cpu')
+        ref_3d_wz = self.get_reference_points(tpv_w, tpv_z, pc_range[4]-pc_range[1], num_points_in_pillar[2], '3d', bs=batch_size, device='cpu')
         ref_3d_wz = ref_3d_wz.permute(3, 0, 1, 2)[[1, 2, 0]]
         ref_3d_wz = ref_3d_wz.permute(1, 2, 3, 0)
         self.register_buffer('ref_3d_hw', ref_3d_hw)
         self.register_buffer('ref_3d_zh', ref_3d_zh)
         self.register_buffer('ref_3d_wz', ref_3d_wz)
-        
-        ref_2d_hw = self.get_reference_points(tpv_h, tpv_w, dim='2d', bs=1, device='cpu')
-        ref_2d_zh = self.get_reference_points(tpv_z, tpv_h, dim='2d', bs=1, device='cpu')
-        ref_2d_wz = self.get_reference_points(tpv_w, tpv_z, dim='2d', bs=1, device='cpu')
+        ref_2d_hw = self.get_reference_points(tpv_h, tpv_w, dim='2d', bs=batch_size, device='cpu')
+        ref_2d_zh = self.get_reference_points(tpv_z, tpv_h, dim='2d', bs=batch_size, device='cpu')
+        ref_2d_wz = self.get_reference_points(tpv_w, tpv_z, dim='2d', bs=batch_size, device='cpu')
         self.register_buffer('ref_2d_hw', ref_2d_hw)
         self.register_buffer('ref_2d_zh', ref_2d_zh)
         self.register_buffer('ref_2d_wz', ref_2d_wz)

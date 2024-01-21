@@ -17,11 +17,62 @@ from mmcv import Config
 from mmcv.runner import build_optimizer
 from mmseg.utils import get_root_logger
 from timm.scheduler import CosineLRScheduler
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.9, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Flatten inputs and targets
+        inputs_flat = inputs.view(-1)
+        targets_flat = targets.view(-1)
+
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs_flat, targets_flat, reduction='none')
+        pt = torch.exp(-BCE_loss)
+
+        # Adjusting alpha for binary classification
+        alpha = torch.tensor([1-self.alpha, self.alpha], device=inputs.device)
+        alpha = alpha.gather(0, targets_flat.long())
+
+        F_loss = alpha * (1-pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
+
+
 
 import warnings
 warnings.filterwarnings("ignore")
 
 save_val_scene_token = ['e7ef871f77f44331aefdebc24ec034b7', '55b3a17359014f398b6bbd90e94a8e1b', '85889db3628342a482c5c0255e5347e9', '5301151d8b6a42b0b252e95634bd3995', '952cb0bcd89b4ca4b904cdcbbf595523', 'fb73d1a6c16147ee9416faf6b310fadb']
+
+def masked_loss(outputs, targets, mask, step, loss_type='l2', rescale=True, eps=1e-8, ):
+    # Apply mask
+    masked_outputs = outputs * mask
+    masked_targets = targets * mask
+
+    # Calculate loss
+    if loss_type == 'l1':
+        loss = F.l1_loss(masked_outputs, masked_targets, reduction='none')
+    elif loss_type == 'l2':
+        loss = F.mse_loss(masked_outputs, masked_targets, reduction='none')
+    else:
+        raise ValueError("Invalid loss_type. Supported types: 'l1', 'l2'")
+
+    # Sum over all elements and divide by the number of masked elements plus epsilon
+    sum_loss = loss.sum()
+    num_masked_elements = 64 * mask.sum().float()
+    mean_loss = sum_loss / (num_masked_elements + eps) if rescale else sum_loss / (num_masked_elements + eps)
+
+    return mean_loss
 
 def pass_print(*args, **kwargs):
     pass
@@ -68,7 +119,7 @@ def main(local_rank, args):
 
         # Generate a timestamped run name
         current_time = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
-        run_name = f"{current_time}-TPVformer_w_NeRF_exp0_L1_loss"
+        run_name = f"{current_time}-TPVformer_w_NeRF_exp0_L2_loss"
         print(f"Starting training run {run_name}")
         
         
@@ -154,7 +205,7 @@ def main(local_rank, args):
     # resume and load
     epoch = 0
     best_val_miou_pts, best_val_miou_vox = 0, 0
-    global_iter = 0
+    global_iter_train = 0
 
     cfg.resume_from = ''
     if osp.exists(osp.join(args.work_dir, 'latest.pth')):
@@ -176,7 +227,7 @@ def main(local_rank, args):
             best_val_miou_pts = ckpt['best_val_miou_pts']
         if 'best_val_miou_vox' in ckpt:
             best_val_miou_vox = ckpt['best_val_miou_vox']
-        global_iter = ckpt['global_iter']
+        global_iter_train = ckpt['global_iter_train']
         print(f'successfully resumed from epoch {epoch}')
     elif cfg.load_from:
         ckpt = torch.load(cfg.load_from, map_location='cpu')
@@ -199,11 +250,11 @@ def main(local_rank, args):
         my_model.train()
         if hasattr(train_dataset_loader.sampler, 'set_epoch'):
             train_dataset_loader.sampler.set_epoch(epoch)
-        loss_list = []
+        
         time.sleep(10)
         data_time_s = time.time()
         time_s = time.time()
-        for i_iter, (imgs, img_metas, train_nerf_vox_feat) in enumerate(train_dataset_loader):
+        for i_iter, (imgs, img_metas, train_nerf_vox_feat, train_occ_label) in enumerate(train_dataset_loader):
             #ipdb.set_trace()
             imgs = imgs.cuda()
             if cfg.lovasz_input == 'voxel' or cfg.ce_input == 'voxel':
@@ -211,35 +262,46 @@ def main(local_rank, args):
             # forward + backward + optimize
             data_time_e = time.time()
             train_nerf_vox_feat = train_nerf_vox_feat.cuda()
-            outputs_vox_feat = my_model(img=imgs, img_metas=img_metas)
+            train_occ_label = train_occ_label.cuda()
+            outputs_vox_feat, outputs_vox_occ_label = my_model(img=imgs, img_metas=img_metas)
+            
+            # train_nerf_vox_feat and outputs_vox_feat has shape [bsz, embed_dim, H, W, Z]
+            # train_occ_label and outputs_vox_occ_label has shape [bsz, 1, H, W, Z]
+            
+            # Step 1: calculate loss for voxel occ label
+            bce_loss_func = nn.BCELoss()
+            focal_loss_func = FocalLoss()
+            occ_loss_train = bce_loss_func(outputs_vox_occ_label, train_occ_label)
+            
+            # Step 2: calculate loss for voxel feat with occ mask
 
-            mse_loss = nn.MSELoss()
-            L1_loss = nn.L1Loss()
-            loss = L1_loss(train_nerf_vox_feat, outputs_vox_feat)
+            # Assuming outputs_vox_feat and train_nerf_vox_feat are your output and target tensors
+            mask = train_occ_label == 1  # Creating a mask where train_occ_label is 1
 
+            feat_loss_train = masked_loss(outputs = outputs_vox_feat, targets = train_nerf_vox_feat, mask = mask, step = global_iter_train)
+            
+            total_loss_train = feat_loss_train + occ_loss_train
+                
             optimizer.zero_grad()
-            loss.backward()
+            total_loss_train.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(my_model.parameters(), cfg.grad_max_norm)
             optimizer.step()
-            loss_list.append(loss.item())
-            scheduler.step_update(global_iter)
+            scheduler.step_update(global_iter_train)
             time_e = time.time()
 
-            global_iter += 1
+            global_iter_train += 1
             if i_iter % print_freq == 0 and dist.get_rank() == 0:
                 lr = optimizer.param_groups[0]['lr']
-                logger.info('[TRAIN] Epoch %d Iter %5d/%d: Loss: %.3f (%.3f), grad_norm: %.1f, lr: %.7f, time: %.3f (%.3f)'%(
-                    epoch, i_iter, len(train_dataset_loader), 
-                    loss.item(), np.mean(loss_list), grad_norm, lr,
-                    time_e - time_s, data_time_e - data_time_s
-                ))
+                logger.info('[TRAIN] Epoch %d Iter %5d/%d: Total_Loss: %.4f, Occ_Loss: %.4f, Feat_Loss: %.4f, LR: %.6f, Grad_Norm: %.4f, Step_Time: %.4f, Data_Time: %.4f'%(epoch, i_iter, len(train_dataset_loader), total_loss_train.item(), occ_loss_train.item(), feat_loss_train.item(), lr, grad_norm, time_e - time_s, data_time_e - data_time_s))
             if dist.get_rank() == 0:
                 #wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/grad_norm": grad_norm, "train/step_time": time_e - time_s, "train/data_time": data_time_e - data_time_s})
-                writer.add_scalar("train/loss", loss.item(), global_iter)
-                writer.add_scalar("train/lr", lr, global_iter)
-                writer.add_scalar("train/grad_norm", grad_norm, global_iter)
-                writer.add_scalar("train/step_time", time_e - time_s, global_iter)
-                writer.add_scalar("train/data_time", data_time_e - data_time_s, global_iter)
+                writer.add_scalar("train/total_loss", total_loss_train.item(), global_iter_train)
+                writer.add_scalar("train/occ_loss", occ_loss_train.item(), global_iter_train)
+                writer.add_scalar("train/feat_loss", feat_loss_train.item(), global_iter_train)
+                writer.add_scalar("train/lr", lr, global_iter_train)
+                writer.add_scalar("train/grad_norm", grad_norm, global_iter_train)
+                writer.add_scalar("train/step_time", time_e - time_s, global_iter_train)
+                writer.add_scalar("train/data_time", data_time_e - data_time_s, global_iter_train)
                 
             data_time_s = time.time()
             time_s = time.time()
@@ -251,7 +313,7 @@ def main(local_rank, args):
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'epoch': epoch + 1,
-                'global_iter': global_iter,
+                'global_iter_train': global_iter_train,
                 'best_val_miou_pts': best_val_miou_pts,
                 'best_val_miou_vox': best_val_miou_vox
             }
@@ -264,35 +326,52 @@ def main(local_rank, args):
         
         # eval
         my_model.eval()
-        val_loss_list = []
         # CalMeanIou_pts.reset()
         # CalMeanIou_vox.reset()
 
+        total_loss_val_list = []
+        feat_loss_val_list = []
+        occ_loss_val_list = []
         with torch.no_grad():
-            for i_iter_val, (imgs, img_metas, val_nerf_vox_feat) in enumerate(val_dataset_loader):
-                
+            for i_iter_val, (imgs, img_metas, val_nerf_vox_feat, val_occ_label) in enumerate(val_dataset_loader):
                 imgs = imgs.cuda()
                 val_nerf_vox_feat = val_nerf_vox_feat.cuda()
+                val_occ_label = val_occ_label.cuda()
 
-                outputs_vox_feat_val = my_model(img=imgs, img_metas=img_metas)
-                mseloss = nn.MSELoss()
-                L1_loss = nn.L1Loss()
-                loss = L1_loss(val_nerf_vox_feat, outputs_vox_feat_val)
+                outputs_vox_feat_val, outputs_vox_occ_label_val = my_model(img=imgs, img_metas=img_metas)
+                # Step 1: calculate loss for voxel occ label
+                bce_loss_func = nn.BCELoss()
+                focal_loss_func = FocalLoss()
+                occ_loss_val = bce_loss_func(outputs_vox_occ_label_val, val_occ_label)
                 
-                val_loss_list.append(loss.detach().cpu().numpy())
+                # Step 2: calculate loss for voxel feat with occ mask
+                mask = val_occ_label == 1 # Creating a mask where train_occ_label is 1
+                feat_loss_val = masked_loss(outputs = outputs_vox_feat_val, targets = val_nerf_vox_feat, mask = mask)
+                
+                total_loss_val = feat_loss_val + occ_loss_val
+                
+                total_loss_val_list.append(total_loss_val.item())
+                feat_loss_val_list.append(feat_loss_val.item())
+                occ_loss_val_list.append(occ_loss_val.item())
+                
                 if i_iter_val % print_freq == 0 and dist.get_rank() == 0:
-                    logger.info('[EVAL] Epoch %d Iter %5d: Loss: %.3f (%.3f)'%(
-                        epoch, i_iter_val, loss.item(), np.mean(val_loss_list)))
+                    logger.info('[EVAL] Epoch %d Iter %5d: Total Loss: %.4f, Occ Loss: %.4f, Feat Loss: %.4f'%(epoch, i_iter_val, total_loss_val.item(), occ_loss_val.item(), feat_loss_val.item()))
                 if dist.get_rank() == 0:
                     # wandb.log({"val/loss": loss.item()})
-                    writer.add_scalar("val/loss", loss.item(), global_iter)
+                    writer.add_scalar("val/toal_loss_mean", np.mean(total_loss_val_list), global_iter_train)
+                    writer.add_scalar("val/occ_loss_mean", np.mean(occ_loss_val_list), global_iter_train)
+                    writer.add_scalar("val/feat_loss_mean", np.mean(feat_loss_val_list), global_iter_train)
                 if img_metas[0]['scene_token'] in save_val_scene_token:
                     save_base_dir = osp.join(val_save_dir, "epoch_{}".format(epoch), img_metas[0]['scene_token'])
                     os.makedirs(save_base_dir, exist_ok=True)
                     outputs_vox_feat_val = outputs_vox_feat_val.detach().cpu().numpy()
-                    save_path = osp.join(save_base_dir, "{}-{}_pred_vox_feat.npy".format(i_iter_val, img_metas[0]['sample_idx']))
-                    np.save(save_path, outputs_vox_feat_val)
-                    logger.info('save pred vox feat to {}'.format(save_path))
+                    save_path_feat = osp.join(save_base_dir, "{}-{}_pred_vox_feat.npy".format(i_iter_val, img_metas[0]['sample_idx']))
+                    np.save(save_path_feat, outputs_vox_feat_val)
+                    #logger.info('save pred vox feat to {}'.format(save_path_feat))
+                    outputs_vox_occ_label_val = outputs_vox_occ_label_val.detach().cpu().numpy()
+                    save_path_occ = osp.join(save_base_dir, "{}-{}_pred_occ.npy".format(i_iter_val, img_metas[0]['sample_idx']))
+                    np.save(save_path_occ, outputs_vox_occ_label_val)
+                    #logger.info('save pred vox feat to {}'.format(save_path_occ))
                     
                     
         
@@ -304,11 +383,11 @@ def main(local_rank, args):
         # if best_val_miou_vox < val_miou_vox:
         #     best_val_miou_vox = val_miou_vox
 
-        # logger.info('Current val miou pts is %.3f while the best val miou pts is %.3f' %
+        # logger.info('Current val miou pts is %.4f while the best val miou pts is %.4f' %
         #         (val_miou_pts, best_val_miou_pts))
-        # logger.info('Current val miou vox is %.3f while the best val miou vox is %.3f' %
+        # logger.info('Current val miou vox is %.4f while the best val miou vox is %.4f' %
         #         (val_miou_vox, best_val_miou_vox))
-        # logger.info('Current val loss is %.3f' %
+        # logger.info('Current val loss is %.4f' %
         #         (np.mean(val_loss_list)))
         
 
@@ -325,5 +404,5 @@ if __name__ == '__main__':
     args.gpus = ngpus
     print(f"Avaliable GPU: {ngpus}")
     print(args)
-    # main(0,args)
-    torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
+    main(0,args)
+    # torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)

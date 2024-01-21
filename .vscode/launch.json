@@ -2,11 +2,31 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python: TPV Occupancy with NeRF",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_w_nerf.py",
+            "args": ["--py-config", "config/tpv04_occupancy_w_nerf.py", "--work-dir", "out/tpv_occupancy"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Python: TPV Occupancy",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/train.py",
             "args": ["--py-config", "config/tpv04_occupancy.py", "--work-dir", "out/tpv_occupancy"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python: TPV Occupancy with NeRF Binary Occ",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_w_nerf_binary_occ.py",
+            "args": ["--py-config", "config/tpv04_occupancy_w_nerf_binary_occ.py", "--work-dir", "out/tpv_occupancy"],
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}"
